@@ -1,0 +1,350 @@
+<html>
+<head>
+  <base href=".">
+  <meta charset="UTF-8">
+  <title>3D Grid MMORPG World</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+  <script src="placed-blocks.js"></script>
+  <script src="placed-assets.js"></script>
+  <script src="assets.js"></script>
+  <script src="block-tools.js"></script>
+</head>
+<body>
+  <div id="editor-container">
+    <div id="grid-container">
+    </div>
+  </div>
+
+  <script>
+    // Add div removal observer
+    const divRemovalObserver = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        if (mutation.addedNodes.length) {
+          // Check for divs added to bottom of body
+          const lastElement = document.body.lastElementChild;
+          if (lastElement && lastElement.tagName === 'DIV' && 
+              !['editor-container', 'grid-container'].includes(lastElement.id)) {
+            lastElement.style.display = 'none'; // Hide the div
+            // Optional: remove instead of hide
+            // lastElement.remove();
+          }
+        }
+      });
+    });
+
+    // Start observing body for changes
+    divRemovalObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+
+    let room = new WebsimSocket();
+    let peers = {};
+    let scene, camera, renderer, controls;
+    let gridBlocks = {};
+    let groundPlane;
+    let loadedModels = [];
+    let placedAssetsData = []; // Renamed from placedAssets to avoid conflict with class
+    const loader = new THREE.GLTFLoader();
+
+    let player;
+    let raycaster = new THREE.Raycaster();
+    let mouse = new THREE.Vector2();
+
+    // Add camera direction exposure for iframe parent
+    window.getCameraDirection = () => {
+      if (!camera || !controls || !controls.target) return 0;
+      // Calculate angle from camera position relative to the player (controls.target)
+      const relativeCamPos = new THREE.Vector3().subVectors(camera.position, controls.target);
+      let angle = Math.atan2(relativeCamPos.z, relativeCamPos.x) * (180 / Math.PI);
+      angle = (angle + 360) % 360; // Normalize to 0-360
+      return angle;
+    };
+
+    // Listen for messages from parent
+    window.addEventListener('message', (event) => {
+      if (event.data === 'getCameraDirection') {
+        // Send camera direction back to parent
+        window.parent.postMessage({
+          type: 'cameraDirection',
+          direction: window.getCameraDirection()
+        }, '*');
+      }
+    });
+
+    function init() {
+      scene = new THREE.Scene();
+      
+      const skyboxGeometry = new THREE.BoxGeometry(1000, 1000, 1000);
+      const skyboxMaterial = new THREE.MeshBasicMaterial({
+        color: 0x87CEEB, 
+        side: THREE.BackSide
+      });
+      const skybox = new THREE.Mesh(skyboxGeometry, skyboxMaterial);
+      scene.add(skybox);
+
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+      renderer = new THREE.WebGLRenderer({
+        antialias: true
+      });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.getElementById('grid-container').appendChild(renderer.domElement);
+      
+      // Player
+      const playerGeometry = new THREE.CapsuleGeometry(0.25, 0.5, 4); // radius, length, capSegments, radialSegments
+      playerGeometry.translate(0, 0.5, 0); // Move geometry so mesh origin is at base of capsule
+      const playerMaterial = new THREE.MeshStandardMaterial({ color: 0xff0000, emissive: 0x330000 });
+      player = new THREE.Mesh(playerGeometry, playerMaterial);
+      player.position.set(0, 0, 0); // Initial position, feet at y=0
+      scene.add(player);
+      
+      // Set initial camera position relative to player
+      camera.position.set(player.position.x, player.position.y + 5, player.position.z + 5);
+      
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;  
+      controls.dampingFactor = 0.05;
+      controls.target.copy(player.position); // Orbit around the player
+
+      // Add control change listener to send updates
+      controls.addEventListener('change', () => {
+        if (window !== window.parent) {
+          window.parent.postMessage({
+            type: 'cameraDirection',
+            direction: window.getCameraDirection()
+          }, '*');
+        }
+      });
+      
+      renderer.domElement.addEventListener('click', onDocumentMouseClick, false);
+
+      // Ground plane
+      const groundGeometry = new THREE.PlaneGeometry(32, 32);
+      const groundMaterial = new THREE.MeshBasicMaterial({
+        visible: false, 
+        side: THREE.DoubleSide
+      });
+      groundPlane = new THREE.Mesh(groundGeometry, groundMaterial);
+      groundPlane.rotation.x = -Math.PI / 2;
+      groundPlane.position.set(0, 0, 0);
+      scene.add(groundPlane);
+
+      // Lighting
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.8); // Increased ambient light a bit
+      scene.add(ambientLight);
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0); // Increased directional light
+      directionalLight.position.set(10, 20, 10);
+      directionalLight.castShadow = true; // Optional: for shadows
+      scene.add(directionalLight);
+
+      // Shadows (optional, can be performance intensive)
+      // renderer.shadowMap.enabled = true;
+      // player.castShadow = true;
+      // groundPlane.receiveShadow = true; // Make ground visible or add blocks to receive shadow
+
+      window.addEventListener('resize', onWindowResize);
+
+      fetch('level.json')
+        .then(response => response.json())
+        .then(levelData => {
+          loadLevel(levelData);
+        })
+        .catch(error => {
+          console.error('Error loading level:', error);
+          // Place player at default if level load fails
+           if (player) player.position.set(0, 0, 0);
+           if (controls) controls.target.copy(player.position);
+        });
+    }
+
+    function onDocumentMouseClick(event) {
+      event.preventDefault();
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+
+      const blockObjects = Object.values(gridBlocks);
+      const intersects = raycaster.intersectObjects(blockObjects);
+
+      if (intersects.length > 0) {
+        const intersectedBlock = intersects[0].object;
+        const blockPosition = intersectedBlock.position;
+        const blockType = intersectedBlock.userData.blockType;
+
+        let playerYTarget;
+        if (blockType === 'full') { // Height 1, centered at Y+0.5. Top is pos.y + 0.5
+          playerYTarget = blockPosition.y + 0.5;
+        } else if (blockType === 'half') { // Height 0.5, centered at Y+0.25. Top is pos.y + 0.25
+          playerYTarget = blockPosition.y + 0.25;
+        } else if (blockType === 'stair') { // Custom geometry, 0.5 height, current code centers it at gridY+0.25. Top is pos.y + 0.25.
+          playerYTarget = blockPosition.y + 0.25;
+        } else { // Default to half-block like height behavior
+          playerYTarget = blockPosition.y + 0.25;
+        }
+        
+        player.position.set(blockPosition.x, playerYTarget, blockPosition.z);
+        controls.target.copy(player.position);
+      }
+    }
+
+    function loadLevel(levelData) {
+      Object.keys(gridBlocks).forEach(key => removeBlockFromScene(key)); // Changed to avoid name clash
+      gridBlocks = {};
+      placedAssetsData.forEach(asset => scene.remove(asset.model));
+      placedAssetsData = [];
+
+      levelData.blocks?.forEach(block => {
+        const newBlock = addBlock(new THREE.Vector3(block.x, block.y, block.z), block.type || 'half');
+        if (block.orientation) {
+          let rotation = 0;
+          switch (block.orientation) {
+            case 'east': rotation = Math.PI / 2; break;
+            case 'south': rotation = Math.PI; break;
+            case 'west': rotation = -Math.PI / 2; break;
+          }
+          newBlock.rotation.y = rotation;
+          newBlock.userData.orientation = block.orientation;
+        }
+        if (block.color) {
+          newBlock.material.color.set('#' + block.color);
+        }
+        if (block.textureUrl) {
+          const textureLoader = new THREE.TextureLoader();
+          textureLoader.load(block.textureUrl, texture => {
+            texture.userData = { url: block.textureUrl };
+            newBlock.material.map = texture;
+            newBlock.material.needsUpdate = true;
+          });
+        }
+        gridBlocks[`${block.x},${block.y},${block.z}`] = newBlock;
+        // newBlock.receiveShadow = true; // Optional for shadows
+      });
+
+      levelData.assets?.forEach(assetData => {
+        loader.load(assetData.url, gltf => {
+          const model = gltf.scene;
+          model.position.set(assetData.position.x, assetData.position.y, assetData.position.z);
+          model.rotation.set(assetData.rotation.x, assetData.rotation.y, assetData.rotation.z);
+          model.scale.set(assetData.scale.x, assetData.scale.y, assetData.scale.z);
+          model.userData.url = assetData.url;
+          model.userData.name = assetData.name;
+          scene.add(model);
+          placedAssetsData.push({ // Use renamed array
+            id: assetData.id, model: model, position: model.position.clone(),
+            url: assetData.url, name: assetData.name
+          });
+        });
+      });
+
+      // Position player after blocks are loaded
+      if (player) {
+        const firstBlockKey = Object.keys(gridBlocks)[0];
+        if (firstBlockKey) {
+          const firstBlock = gridBlocks[firstBlockKey];
+          let playerYTarget;
+          const blockType = firstBlock.userData.blockType;
+          if (blockType === 'full') { playerYTarget = firstBlock.position.y + 0.5; }
+          else if (blockType === 'half') { playerYTarget = firstBlock.position.y + 0.25; }
+          else if (blockType === 'stair') { playerYTarget = firstBlock.position.y + 0.25; }
+          else { playerYTarget = firstBlock.position.y + 0.25; }
+          player.position.set(firstBlock.position.x, playerYTarget, firstBlock.position.z);
+        } else {
+          player.position.set(0, 0, 0); // Default if no blocks
+        }
+        if (controls) controls.target.copy(player.position);
+      }
+    }
+
+    function addBlock(position, blockType = 'half') {
+      let geometry;
+      switch (blockType) {
+        case 'full': geometry = new THREE.BoxGeometry(1, 1, 1); break;
+        case 'stair': geometry = createStairGeometry(); break;
+        default: geometry = new THREE.BoxGeometry(1, 0.5, 1);
+      }
+
+      const material = new THREE.MeshPhongMaterial({ color: 0x8888ff });
+      const block = new THREE.Mesh(geometry, material);
+      block.userData.blockType = blockType;
+
+      const adjustedX = position.x + 0.5;
+      // This calculation determines the block mesh's center Y position.
+      // Full block (height 1) center is at gridY + 0.5
+      // Half block (height 0.5) center is at gridY + 0.25
+      // Stair block (height 0.5, local origin at its base) center is at gridY + 0.25
+      const adjustedY = position.y + (blockType === 'full' ? 0.5 : 
+                                    blockType === 'half' ? 0.25 : 
+                                    blockType === 'stair' ? 0.25 : 0.25);
+      const adjustedZ = position.z + 0.5;
+
+      block.position.set(adjustedX, adjustedY, adjustedZ);
+      block.userData.key = `${position.x},${position.y},${position.z}`;
+      scene.add(block);
+      return block;
+    }
+
+    function createStairGeometry() {
+      // Creates geometry with base at y=0 and top at y=0.5 locally
+      const geometry = new THREE.BufferGeometry();
+      const complexStairVertices = new Float32Array([
+        -0.5, 0.0, 0.5,   0.5, 0.0, 0.5,   0.5, 0.25, 0.5,  -0.5, 0.25, 0.5, // Base step front face (0-3)
+        -0.5, 0.0, -0.5,  0.5, 0.0, -0.5,  0.5, 0.25, -0.5, -0.5, 0.25, -0.5, // Base step back face (4-7)
+        // Upper step vertices (relative to stair origin, so y from 0.25 to 0.5)
+        // This part defines the L-shape of the stair top
+        -0.5, 0.25, 0.5,  /*8*/  0.0, 0.25, 0.5,  /*9*/  0.0, 0.5, 0.5,   /*10*/ -0.5, 0.5, 0.5,   /*11*/ // Front part of upper step
+        -0.5, 0.25, -0.5, /*12*/ 0.0, 0.25, -0.5, /*13*/ 0.0, 0.5, -0.5,  /*14*/ -0.5, 0.5, -0.5   /*15*/ // Back part of upper step
+      ]);
+      const complexStairIndices = new Uint16Array([
+        0, 1, 2,    0, 2, 3,    // Base front
+        4, 6, 5,    4, 7, 6,    // Base back
+        0, 4, 5,    0, 5, 1,    // Base bottom face
+        3, 7, 4,    3, 4, 0,    // Base left face
+        2, 1, 5,    2, 5, 6,    // Base right face
+        3, 2, 6,    3, 6, 7,    // Base top face (becomes bottom of L)
+
+        8,  9, 10,  8, 10, 11, // Upper step front-left part, top surface
+        // Connecting faces between lower and upper steps
+        // Original indices were:
+        // 0, 1, 2,    0, 2, 3,    4, 5, 6,    4, 6, 7,
+        // 0, 4, 7,    0, 7, 3,    1, 5, 6,    1, 6, 2,
+        // 3, 2, 6,    3, 6, 7,    0, 1, 5,    0, 5, 4,
+        // 8, 9, 10,   8, 10, 11,  12, 13, 14, 12, 14, 15,
+        // 8, 12, 15,  8, 15, 11,  9, 13, 14,  9, 14, 10,
+        // 11, 10, 14, 11, 14, 15, 8, 9, 13,   8, 13, 12
+      ]);
+      geometry.setAttribute('position', new THREE.BufferAttribute(complexStairVertices, 3));
+      geometry.setIndex(new THREE.BufferAttribute(complexStairIndices, 1));
+
+      geometry.computeVertexNormals();
+      return geometry;
+    }
+
+    function removeBlockFromScene(key) { // Renamed from removeBlock
+      const block = gridBlocks[key];
+      if (block) {
+        scene.remove(block);
+        delete gridBlocks[key];
+      }
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    init();
+    animate();
+  </script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
